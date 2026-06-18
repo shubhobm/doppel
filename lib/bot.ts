@@ -100,37 +100,72 @@ function formatRetrievedContext(chunks: Array<{ source: { filename: string; chun
     .join("\n\n---\n\n");
 }
 
-export async function generateBotAnswer(params: {
-  botId: string;
-  sessionKey: string;
+function buildMessages(params: {
+  systemPrompt: string;
+  retrievedContext: string;
+  hasRetrievedChunks: boolean;
+  conversation: string;
   question: string;
+  budget: number;
+  contextSlice?: number;
+  chunks: Array<{ source: { filename: string; chunkIndex: number }; content: string }>;
 }) {
-  const bot = await db.studentBot.findUnique({
-    where: { id: params.botId },
-    include: {
-      documents: {
-        include: {
-          chunks: true
-        }
+  const contextText = params.contextSlice !== undefined
+    ? formatRetrievedContext(params.chunks.slice(0, params.contextSlice))
+    : params.retrievedContext;
+
+  return {
+    model: CHAT_MODEL,
+    max_completion_tokens: params.budget,
+    messages: [
+      {
+        role: "system" as const,
+        content: params.systemPrompt
+      },
+      {
+        role: "user" as const,
+        content: params.hasRetrievedChunks
+          ? [
+              "Use the retrieved chunks below as the primary source of truth.",
+              "If the answer is not in the chunks, say the material is insufficient.",
+              "Keep the final answer concise and direct.",
+              "",
+              `Retrieved chunks:\n${contextText}`,
+              "",
+              `Conversation so far:\n${params.conversation}`,
+              "",
+              `Current question:\n${params.question}`
+            ].join("\n")
+          : [
+              "No retrieved chunks are available for this request.",
+              "Answer using the student system prompt and conversation history only.",
+              "Keep the final answer concise and direct.",
+              "",
+              `Conversation so far:\n${params.conversation}`,
+              "",
+              `Current question:\n${params.question}`
+            ].join("\n")
       }
-    }
-  });
+    ]
+  };
+}
 
-  if (!bot) {
-    throw new Error("Bot not found");
-  }
+async function prepareContext(botId: string, sessionKey: string, question: string, systemPromptText: string) {
+  // session creation and RAG retrieval are independent — run in parallel
+  const [session, chunks] = await Promise.all([
+    getOrCreateChatSession(botId, sessionKey),
+    retrieveRelevantChunks(botId, question, 6)
+  ]);
 
-  const client = getOpenAIClient();
-  const session = await getOrCreateChatSession(bot.id, params.sessionKey);
   const recentMessages = await getRecentMessages(session.id);
-  const chunks = await retrieveRelevantChunks(bot.id, params.question, 6);
+
   const hasRetrievedChunks = chunks.length > 0;
   const retrievedContext = formatRetrievedContext(chunks);
 
   const conversation = recentMessages
     .reverse()
     .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
-    .concat([`USER: ${params.question}`])
+    .concat([`USER: ${question}`])
     .join("\n\n");
 
   const systemPrompt = [
@@ -143,12 +178,31 @@ export async function generateBotAnswer(params: {
       ? "If the context is insufficient, say so briefly and give the best grounded answer you can."
       : "Provide a best-effort direct answer without asking for retrieved chunks.",
     "Do not mention internal policies or retrieval mechanics unless asked.",
-    bot.systemPrompt ? `Student system prompt: ${bot.systemPrompt}` : ""
+    systemPromptText ? `Student system prompt: ${systemPromptText}` : ""
   ]
     .filter(Boolean)
     .join("\n");
 
-  let answer = "";
+  return { session, chunks, hasRetrievedChunks, retrievedContext, conversation, systemPrompt };
+}
+
+// Used by the admin endpoint where the full answer is needed synchronously.
+export async function generateBotAnswer(params: {
+  botId: string;
+  sessionKey: string;
+  question: string;
+}) {
+  const bot = await db.studentBot.findUnique({
+    where: { id: params.botId }
+  });
+
+  if (!bot) {
+    throw new Error("Bot not found");
+  }
+
+  const client = getOpenAIClient();
+  const ctx = await prepareContext(bot.id, params.sessionKey, params.question, bot.systemPrompt);
+
   const trace: {
     llmAttempted: boolean;
     llmUsed: boolean;
@@ -164,85 +218,113 @@ export async function generateBotAnswer(params: {
     attempts: 0
   };
 
+  let answer = "";
+
   if (client) {
     try {
-      const runCompletion = async (contextText: string, budget: number) => {
+      const completionBudget = Math.max(bot.maxOutputTokens, 1200);
+
+      const run = async (contextSlice?: number) => {
         trace.llmAttempted = true;
         trace.attempts += 1;
-        const completion = await client.chat.completions.create({
-          model: CHAT_MODEL,
-          max_completion_tokens: budget,
-          messages: [
-            {
-              role: "system",
-              content: systemPrompt
-            },
-            {
-              role: "user",
-              content: hasRetrievedChunks
-                ? [
-                    "Use the retrieved chunks below as the primary source of truth.",
-                    "If the answer is not in the chunks, say the material is insufficient.",
-                    "Keep the final answer concise and direct.",
-                    "",
-                    `Retrieved chunks:\n${contextText}`,
-                    "",
-                    `Conversation so far:\n${conversation}`,
-                    "",
-                    `Current question:\n${params.question}`
-                  ].join("\n")
-                : [
-                    "No retrieved chunks are available for this request.",
-                    "Answer using the student system prompt and conversation history only.",
-                    "Keep the final answer concise and direct.",
-                    "",
-                    `Conversation so far:\n${conversation}`,
-                    "",
-                    `Current question:\n${params.question}`
-                  ].join("\n")
-            }
-          ]
-        });
-
+        const completion = await client.chat.completions.create(
+          buildMessages({ ...ctx, budget: completionBudget, contextSlice, question: params.question })
+        );
         trace.llmModel = completion.model;
         trace.finishReason = completion.choices?.[0]?.finish_reason;
-        const rawContent = completion.choices?.[0]?.message?.content;
-
-        if (typeof rawContent === "string") {
-          return rawContent.trim();
-        }
-
-        return "";
+        return completion.choices?.[0]?.message?.content?.trim() ?? "";
       };
 
-      const completionBudget = Math.max(bot.maxOutputTokens, 1200);
-      answer = await runCompletion(retrievedContext, completionBudget);
-
+      answer = await run();
       if (!answer && trace.finishReason === "length") {
-        const shorterContext = formatRetrievedContext(chunks.slice(0, 2));
-        answer = await runCompletion(shorterContext, Math.max(completionBudget, 2200));
+        answer = await run(2);
       }
     } catch (error) {
       console.error("LLM response generation failed", error);
       trace.error = error instanceof Error ? error.message : String(error);
-      answer = "";
     }
   }
 
   if (!answer) {
     trace.fallbackUsed = true;
-    answer = fallbackAnswer(params.question, chunks);
+    answer = fallbackAnswer(params.question, ctx.chunks);
   } else {
     trace.llmUsed = true;
   }
 
-  await saveChatMessage(session.id, "user", params.question);
-  await saveChatMessage(session.id, "assistant", answer);
+  // save user and assistant messages in parallel
+  await Promise.all([
+    saveChatMessage(ctx.session.id, "user", params.question),
+    saveChatMessage(ctx.session.id, "assistant", answer)
+  ]);
 
   return {
-    sessionId: session.id,
+    sessionId: ctx.session.id,
     answer,
-    chunks,
+    chunks: ctx.chunks,
     trace
   };
+}
+
+// Used by the student chat endpoint. Streams tokens to the client and fires off
+// DB saves after the stream completes so the client isn't blocked on writes.
+// onComplete receives the full answer text for callers that need to log it.
+export async function streamBotAnswer(params: {
+  botId: string;
+  sessionKey: string;
+  question: string;
+  onComplete?: (answer: string) => void;
+}): Promise<ReadableStream<Uint8Array>> {
+  const bot = await db.studentBot.findUnique({
+    where: { id: params.botId }
+  });
+
+  if (!bot) {
+    throw new Error("Bot not found");
+  }
+
+  const client = getOpenAIClient();
+  const ctx = await prepareContext(bot.id, params.sessionKey, params.question, bot.systemPrompt);
+  const encoder = new TextEncoder();
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      let answer = "";
+
+      if (client) {
+        try {
+          const completionBudget = Math.max(bot.maxOutputTokens, 1200);
+          const llmStream = await client.chat.completions.create({
+            ...buildMessages({ ...ctx, budget: completionBudget, question: params.question }),
+            stream: true
+          });
+
+          for await (const chunk of llmStream) {
+            const token = chunk.choices[0]?.delta?.content ?? "";
+            if (token) {
+              answer += token;
+              controller.enqueue(encoder.encode(token));
+            }
+          }
+        } catch (error) {
+          console.error("LLM stream failed", error);
+        }
+      }
+
+      if (!answer) {
+        answer = fallbackAnswer(params.question, ctx.chunks);
+        controller.enqueue(encoder.encode(answer));
+      }
+
+      controller.close();
+
+      // DB writes happen after the stream is closed — client is already unblocked
+      Promise.all([
+        saveChatMessage(ctx.session.id, "user", params.question),
+        saveChatMessage(ctx.session.id, "assistant", answer)
+      ]).catch((err) => console.error("Failed to save chat messages", err));
+
+      params.onComplete?.(answer);
+    }
+  });
 }

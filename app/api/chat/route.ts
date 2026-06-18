@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { getSessionUserFromRequest } from "@/lib/request";
-import { generateBotAnswer } from "@/lib/bot";
+import { streamBotAnswer } from "@/lib/bot";
 
 const bodySchema = z.object({
   botId: z.string().min(1),
@@ -28,29 +28,34 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Bot not found." }, { status: 404 });
   }
 
-  const result = await generateBotAnswer({
-    botId: bot.id,
-    sessionKey: parsed.data.sessionKey,
-    question: parsed.data.question
-  });
-
-  await db.queryLog.create({
-    data: {
+  let stream: ReadableStream<Uint8Array>;
+  try {
+    stream = await streamBotAnswer({
       botId: bot.id,
-      userId: session.user.id,
-      actorRole: "STUDENT",
+      sessionKey: parsed.data.sessionKey,
       question: parsed.data.question,
-      answer: result.answer,
-      configVersion: bot.configVersion
-    }
-  });
+      onComplete: (answer) => {
+        db.queryLog.create({
+          data: {
+            botId: bot.id,
+            userId: session.user.id,
+            actorRole: "STUDENT",
+            question: parsed.data.question,
+            answer,
+            configVersion: bot.configVersion
+          }
+        }).catch((err: unknown) => console.error("queryLog write failed", err));
+      }
+    });
+  } catch {
+    return NextResponse.json({ error: "Failed to generate answer." }, { status: 500 });
+  }
 
-  return NextResponse.json({
-    answer: result.answer,
-    retrievedChunks: result.chunks.map((chunk) => ({
-      filename: chunk.source.filename,
-      chunkIndex: chunk.source.chunkIndex
-    })),
-    trace: result.trace
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Cache-Control": "no-cache"
+    }
   });
 }

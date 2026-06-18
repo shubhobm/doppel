@@ -47,7 +47,8 @@ export async function POST(request: NextRequest) {
     question: parsed.data.question
   });
 
-  await db.queryLog.create({
+  // fire-and-forget — admin doesn't need to wait for the log write
+  db.queryLog.create({
     data: {
       botId: bot.id,
       userId: bot.userId,
@@ -56,7 +57,7 @@ export async function POST(request: NextRequest) {
       answer: result.answer,
       configVersion: bot.configVersion
     }
-  });
+  }).catch((err: unknown) => console.error("queryLog write failed", err));
 
   return NextResponse.json({
     userId: bot.userId,

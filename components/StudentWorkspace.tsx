@@ -404,8 +404,7 @@ export function StudentWorkspace({
     }
     setChatLoading(true);
     setError("");
-    const nextChat = [...chat, { role: "user" as const, content: query.trim() }];
-    setChat(nextChat);
+    setChat((prev) => [...prev, { role: "user" as const, content: query.trim() }]);
     const currentQuery = query.trim();
     setQuery("");
 
@@ -419,14 +418,44 @@ export function StudentWorkspace({
       headers: { "Content-Type": "application/json" },
       body
     });
-    const payload = await response.json();
-    setChatLoading(false);
+
     if (!response.ok) {
-      setError(payload.error ?? "Chat failed");
+      const payload = await response.json().catch(() => ({}));
+      setChatLoading(false);
+      setError((payload as { error?: string }).error ?? "Chat failed");
       return;
     }
 
-    setChat((existing) => [...existing, { role: "assistant", content: payload.answer }]);
+    // Admin endpoint still returns full JSON; student endpoint streams plain text.
+    if (useAdminQueryEndpoint) {
+      const payload = await response.json();
+      setChatLoading(false);
+      setChat((prev) => [...prev, { role: "assistant" as const, content: payload.answer }]);
+      return;
+    }
+
+    // Streaming path: add a placeholder then append each token as it arrives.
+    setChat((prev) => [...prev, { role: "assistant" as const, content: "" }]);
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const token = decoder.decode(value, { stream: true });
+        setChat((prev) => {
+          const updated = [...prev];
+          updated[updated.length - 1] = {
+            role: "assistant",
+            content: updated[updated.length - 1].content + token
+          };
+          return updated;
+        });
+      }
+    } finally {
+      setChatLoading(false);
+    }
   }
 
   if (!currentBot) {
