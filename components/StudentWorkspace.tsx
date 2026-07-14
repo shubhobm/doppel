@@ -492,7 +492,7 @@ export function StudentWorkspace({
               </div>
               <p>
                 {uploadsEnabled
-                  ? "Upload PDFs, text files, DOCX, or markdown files. The system indexes them automatically."
+                  ? "Upload PDFs, text files, DOCX, or markdown files. Each file should be smaller than 4.5MB."
                   : "Source uploads are disabled. This chatbot currently runs in system-prompt-only mode."}
               </p>
               <p className="small">You can upload multiple files at once. Click Save Settings below to reflect the changes.</p>
