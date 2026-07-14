@@ -3,17 +3,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { env } from "@/lib/env";
 import { getSessionUserFromRequest } from "@/lib/request";
-import { ALLOWED_MIME_TYPES, MAX_FILES, MAX_TOTAL_UPLOAD_BYTES } from "@/lib/limits";
-import { chunkText, extractTextFromUpload, saveUploadedFile } from "@/lib/files";
-
-function mimeAllowed(file: File) {
-  if (ALLOWED_MIME_TYPES.has(file.type)) {
-    return true;
-  }
-
-  const lower = file.name.toLowerCase();
-  return lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".pdf") || lower.endsWith(".docx");
-}
+import { MAX_FILES, MAX_TOTAL_UPLOAD_BYTES, isUploadMimeAllowed } from "@/lib/limits";
+import { saveUploadedFile } from "@/lib/files";
+import { createSourceDocumentFromBuffer } from "@/lib/documents";
 
 export async function POST(request: NextRequest) {
   if (!env.UPLOADS_ENABLED) {
@@ -65,7 +57,7 @@ export async function POST(request: NextRequest) {
   }
 
   for (const file of files) {
-    if (!mimeAllowed(file)) {
+    if (!isUploadMimeAllowed(file.type, file.name)) {
       return NextResponse.json({ error: `Unsupported file type: ${file.name}` }, { status: 400 });
     }
   }
@@ -80,54 +72,18 @@ export async function POST(request: NextRequest) {
   }> = [];
 
   for (const file of files) {
-    let documentId = "";
-
     try {
       const { storagePath, buffer } = await saveUploadedFile(bot.id, file);
-      const text = await extractTextFromUpload(file, buffer);
-      const chunks = chunkText(text);
-      const document = await db.sourceDocument.create({
-        data: {
-          botId: bot.id,
-          filename: file.name,
-          storagePath,
-          mimeType: file.type || "text/plain",
-          sizeBytes: file.size,
-          chunkCount: chunks.length,
-          status: "PROCESSING"
-        }
-      });
-      documentId = document.id;
-
-      for (let index = 0; index < chunks.length; index += 1) {
-        const content = chunks[index];
-        await db.documentChunk.create({
-          data: {
-            documentId,
-            chunkIndex: index,
-            content,
-            metadata: {
-              filename: file.name,
-              chunkIndex: index,
-              documentId
-            }
-          }
-        });
-      }
-
-      await db.sourceDocument.update({
-        where: { id: documentId },
-        data: { status: "READY" }
-      });
-
-      results.push({
-        id: documentId,
+      const document = await createSourceDocumentFromBuffer({
+        botId: bot.id,
         filename: file.name,
         mimeType: file.type || "text/plain",
         sizeBytes: file.size,
-        status: "READY",
-        chunkCount: chunks.length
+        storagePath,
+        buffer
       });
+
+      results.push(document);
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error("Upload processing failed", {
@@ -138,13 +94,6 @@ export async function POST(request: NextRequest) {
         backend: env.UPLOAD_BACKEND,
         error: errorMessage
       });
-
-      if (documentId) {
-        await db.sourceDocument.update({
-          where: { id: documentId },
-          data: { status: "FAILED" }
-        });
-      }
 
       if (errorMessage.includes("BLOB_READ_WRITE_TOKEN")) {
         return NextResponse.json(

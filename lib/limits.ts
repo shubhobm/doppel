@@ -7,6 +7,14 @@ export const ALLOWED_MIME_TYPES = new Set([
   "text/markdown",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 ]);
+export function isUploadMimeAllowed(mimeType: string, filename: string) {
+  if (ALLOWED_MIME_TYPES.has(mimeType)) {
+    return true;
+  }
+
+  const lower = filename.toLowerCase();
+  return lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".pdf") || lower.endsWith(".docx");
+}
 export const SESSION_COOKIE = "midterm_session";
 export const VERIFY_LINK_EXPIRY_HOURS = 24;
 export const CHAT_HISTORY_LIMIT = 8;

@@ -12,6 +12,10 @@ export async function ensureUploadDir(botId: string) {
   return dir;
 }
 
+export function resolveBlobAccess(): "public" | "private" {
+  return process.env.BLOB_ACCESS?.toLowerCase() === "public" ? "public" : "private";
+}
+
 export async function saveUploadedFile(botId: string, file: File) {
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
   const fileName = `${Date.now()}-${crypto.randomUUID()}-${safeName}`;
@@ -24,11 +28,9 @@ export async function saveUploadedFile(botId: string, file: File) {
       throw new Error("BLOB_READ_WRITE_TOKEN is required when UPLOAD_BACKEND=vercel-blob");
     }
 
-    const configuredAccess = process.env.BLOB_ACCESS?.toLowerCase() === "public" ? "public" : "private";
-
     const blobPath = `uploads/${botId}/${fileName}`;
     const blob = await put(blobPath, buffer, {
-      access: configuredAccess,
+      access: resolveBlobAccess(),
       addRandomSuffix: false,
       contentType: file.type || "application/octet-stream",
       token
@@ -71,9 +73,7 @@ function cleanText(text: string) {
     .trim();
 }
 
-export async function extractTextFromUpload(file: File, buffer: Buffer) {
-  const mimeType = file.type || "text/plain";
-
+export async function extractTextFromUpload(mimeType: string, buffer: Buffer) {
   if (mimeType === "application/pdf") {
     const result = await pdfParse(buffer);
     return cleanText(result.text);

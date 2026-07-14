@@ -4,6 +4,7 @@ import { readSessionFromCookies } from "@/lib/auth";
 import { StudentWorkspace } from "@/components/StudentWorkspace";
 import { ensureDemoBotForUser } from "@/lib/demoBot";
 import { env } from "@/lib/env";
+import { resolveBlobAccess } from "@/lib/files";
 
 type WorkspacePageProps = {
   searchParams?: Promise<{ bot?: string; owner?: string }>;
@@ -94,6 +95,8 @@ export default async function WorkspacePage({ searchParams }: WorkspacePageProps
         }))}
         activeBotId={activeBot.id}
         uploadsEnabled={env.UPLOADS_ENABLED}
+        uploadBackend={env.UPLOAD_BACKEND}
+        blobAccess={resolveBlobAccess()}
         totalBytes={totalBytes}
         readOnly={isAdminViewingOtherUser}
         useAdminQueryEndpoint={isAdminViewingOtherUser}

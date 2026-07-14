@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { type ChangeEvent, useEffect, useMemo, useState } from "react";
+import { upload } from "@vercel/blob/client";
 
 type DocumentRecord = {
   id: string;
@@ -32,6 +33,8 @@ type Props = {
   activeBotId: string;
   totalBytes: number;
   uploadsEnabled: boolean;
+  uploadBackend: "local" | "vercel-blob";
+  blobAccess: "public" | "private";
   readOnly?: boolean;
   useAdminQueryEndpoint?: boolean;
 };
@@ -41,11 +44,57 @@ type ChatEntry = {
   content: string;
 };
 
+async function uploadFileViaApiRoute(file: File, botId: string): Promise<DocumentRecord | undefined> {
+  const formData = new FormData();
+  formData.append("botId", botId);
+  formData.append("files", file);
+
+  const response = await fetch("/api/documents/upload", { method: "POST", body: formData });
+  const payload = await response.json().catch(() => ({}));
+  const docs = Array.isArray(payload.documents) ? (payload.documents as DocumentRecord[]) : [];
+
+  if (!response.ok) {
+    return undefined;
+  }
+  return docs[0];
+}
+
+async function uploadFileDirectToBlob(
+  file: File,
+  botId: string,
+  access: "public" | "private"
+): Promise<DocumentRecord | undefined> {
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const pathname = `uploads/${botId}/${Date.now()}-${crypto.randomUUID()}-${safeName}`;
+
+  const blob = await upload(pathname, file, {
+    access,
+    contentType: file.type || "application/octet-stream",
+    handleUploadUrl: "/api/documents/upload-token",
+    clientPayload: JSON.stringify({ botId, size: file.size, mimeType: file.type || "text/plain" })
+  });
+
+  const finalizeResponse = await fetch("/api/documents/upload/finalize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ botId, url: blob.url })
+  });
+  const finalizePayload = await finalizeResponse.json().catch(() => ({}));
+  const docs = Array.isArray(finalizePayload.documents) ? (finalizePayload.documents as DocumentRecord[]) : [];
+
+  if (!finalizeResponse.ok) {
+    return undefined;
+  }
+  return docs[0];
+}
+
 export function StudentWorkspace({
   bots,
   activeBotId,
   totalBytes,
   uploadsEnabled,
+  uploadBackend,
+  blobAccess,
   readOnly = false,
   useAdminQueryEndpoint = false
 }: Props) {
@@ -277,25 +326,16 @@ export function StudentWorkspace({
         const tempId = tempIdByFileKey.get(key) || "";
 
         try {
-          const formData = new FormData();
-          formData.append("botId", currentBot.id);
-          formData.append("files", file);
-
-          const response = await Promise.race([
-            fetch("/api/documents/upload", {
-              method: "POST",
-              body: formData
-            }),
-            new Promise<Response>((_, reject) => {
+          const uploadedDoc = await Promise.race([
+            uploadBackend === "vercel-blob"
+              ? uploadFileDirectToBlob(file, currentBot.id, blobAccess)
+              : uploadFileViaApiRoute(file, currentBot.id),
+            new Promise<never>((_, reject) => {
               setTimeout(() => reject(new Error("UPLOAD_TIMEOUT")), 120000);
             })
           ]);
 
-          const payload = await response.json().catch(() => ({}));
-          const docs = Array.isArray(payload.documents) ? (payload.documents as DocumentRecord[]) : [];
-          const uploadedDoc = docs[0];
-
-          if (!response.ok || !uploadedDoc) {
+          if (!uploadedDoc) {
             failedFiles.push(file.name);
             if (tempId) {
               upsertDocumentForCurrentBot({
