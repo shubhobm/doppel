@@ -1,0 +1,1362 @@
+openapi: 3.1.0
+info:
+  title: Doppel Chatbot Studio API
+  version: 0.1.0
+  description: |
+    HTTP API for Doppel Chatbot Studio. All request and response bodies are JSON,
+    except the file upload endpoint, which takes `multipart/form-data`.
+
+    ## Authentication
+
+    There are three ways to authenticate. Each endpoint lists the one it accepts.
+
+    | Scheme | How | Used by |
+    |---|---|---|
+    | `sessionCookie` | Call `POST /api/auth/login`. The response sets an HTTP-only cookie named `midterm_session`, valid for 7 days. Send it on later requests. In production the cookie is `Secure`, so it is only sent over HTTPS or to localhost. | The web app, and admin scripts that log in |
+    | `graderKey` | Header `x-grader-key: <GRADER_API_KEY>` | `POST /api/grader/query` |
+    | `adminKey` | Header `x-admin-key: <ADMIN_API_KEY>` | `/api/admin/key/*` |
+
+    If `GRADER_API_KEY` or `ADMIN_API_KEY` is not set on the server, the endpoints that use
+    that key reject every request with `401`.
+
+    ## Roles
+
+    Session endpoints check the logged-in user's role: `STUDENT`, `GRADER` or `ADMIN`.
+    Endpoints under `/api/bots`, `/api/chat` and `/api/documents` only act on bots owned by the
+    logged-in user, whatever their role. A bot owned by someone else returns `404`.
+
+    ## Errors
+
+    Handled errors return a JSON body of the form `{"error": "<message>"}`.
+    Some failures are not handled: a database error, a model error that the fallback doesn't
+    catch, or a grader query for a missing or unsubmitted bot. These return `500` with
+    Next.js's default response body, which is not JSON.
+
+    ## Identifiers
+
+    All IDs are [CUID](https://github.com/paralleldrive/cuid) strings, for example `cm5x8k2qv0001abcd1234efgh`.
+    In the database, a user's username is stored in a field named `email`. Responses use
+    `email` or `username` for that same value, depending on the endpoint.
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://{host}
+    description: Your deployment
+    variables:
+      host:
+        default: your-project.vercel.app
+
+tags:
+  - name: Auth
+    description: Log in, log out, change password.
+  - name: Bots
+    description: The logged-in user's own chatbots.
+  - name: Documents
+    description: Source files attached to a bot.
+  - name: Chat
+    description: Preview chat with your own bot.
+  - name: Grader
+    description: Query submitted bots with the grader API key.
+  - name: Admin (session)
+    description: Admin operations for a logged-in user with the `ADMIN` role.
+  - name: Admin (API key)
+    description: Admin operations for scripts, authenticated with `ADMIN_API_KEY`.
+
+paths:
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: |
+        Checks a username and password and sets the `midterm_session` cookie.
+
+        If the username is the built-in admin (`STATIC_USERNAME` in `lib/limits.ts`), the admin account
+        is created on first login and accepts `STATIC_PASSWORD` until the admin changes the password.
+        After that change, only the new password works.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 1
+                  description: Username only. Case-insensitive, and must not contain `@`.
+                  example: asha.rao
+                password:
+                  type: string
+                  minLength: 1
+      responses:
+        "200":
+          description: Logged in. The response sets the session cookie.
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              example: midterm_session=eyJhbGciOi...; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+        "400":
+          description: Missing fields, or the username contains `@`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                withAt:
+                  value: { error: "Use username only." }
+        "401":
+          $ref: "#/components/responses/InvalidCredentials"
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out
+      description: Clears the session cookie. This always succeeds, even when no one is logged in.
+      operationId: logout
+      security: []
+      responses:
+        "200":
+          description: Cookie cleared.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+
+  /api/auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Change password
+      description: |
+        Changes the logged-in user's password. Despite the path, this is not a reset flow:
+        the caller must be logged in and must supply the current password.
+      operationId: changePassword
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword:
+                  type: string
+                  minLength: 1
+                newPassword:
+                  type: string
+                  minLength: 8
+                  maxLength: 128
+                  description: Must be different from `currentPassword`.
+      responses:
+        "200":
+          description: Password updated. Existing sessions stay valid.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, message]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                  message:
+                    type: string
+                    example: Password updated.
+        "400":
+          description: Missing fields, new password too short or too long, or the same as the current one.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Not logged in, or the current password is wrong.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                wrongPassword:
+                  value: { error: "Current password is incorrect." }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/bots:
+    get:
+      tags: [Bots]
+      summary: List my bots
+      description: Returns every bot owned by the logged-in user, oldest first, with each bot's documents (newest first).
+      operationId: listMyBots
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The user's bots.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bots]
+                properties:
+                  bots:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BotWithDocuments"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Bots]
+      summary: Create a bot
+      description: |
+        Creates a draft bot owned by the logged-in user. The system prompt starts as
+        `You are a study assistant for <name>.` and the other settings use their defaults.
+      operationId: createBot
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: Trimmed and cut to 120 characters. If it is empty or missing, the name is `New chatbot`.
+                  example: Corporate Finance Tutor
+      responses:
+        "200":
+          description: The new bot.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bot]
+                properties:
+                  bot:
+                    $ref: "#/components/schemas/BotWithDocuments"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/bots/{botId}:
+    parameters:
+      - $ref: "#/components/parameters/BotId"
+    get:
+      tags: [Bots]
+      summary: Get one of my bots
+      operationId: getMyBot
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: The bot and its documents.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bot]
+                properties:
+                  bot:
+                    $ref: "#/components/schemas/BotWithDocuments"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Bots]
+      summary: Update bot settings
+      description: |
+        Replaces the bot's name, system prompt and settings. All fields are required.
+        Each successful update increments `configVersion`. A submitted bot can't be edited
+        until the submission is reverted.
+
+        Note: only `maxOutputTokens` is currently sent to the model. `temperature`, `topP` and `topK`
+        are stored but not used.
+      operationId: updateMyBot
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotSettings"
+      responses:
+        "200":
+          description: The updated bot, without documents.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bot]
+                properties:
+                  bot:
+                    $ref: "#/components/schemas/Bot"
+        "400":
+          description: A field is missing or out of range.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Invalid bot settings." }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/BotSubmitted"
+    post:
+      tags: [Bots]
+      summary: Submit or revert a bot
+      description: |
+        `submit` sets the status to `SUBMITTED` and records `submittedAt`. `revert` sets it back to `DRAFT`
+        and clears `submittedAt`. Either action increments `configVersion`. Neither checks the current
+        status, so submitting an already-submitted bot updates `submittedAt`.
+      operationId: setBotSubmission
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [submit, revert]
+      responses:
+        "200":
+          description: The updated bot, without documents.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bot]
+                properties:
+                  bot:
+                    $ref: "#/components/schemas/Bot"
+        "400":
+          description: '`action` is missing, or is not `submit` or `revert`.'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Unsupported action." }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Bots]
+      summary: Delete a bot
+      description: Deletes the bot along with its documents, chunks, chat sessions and query logs. Demo bots can't be deleted. Stored files are not removed from disk or Blob storage.
+      operationId: deleteMyBot
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Demo bot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Demo chatbot cannot be deleted." }
+
+  /api/documents/upload:
+    post:
+      tags: [Documents]
+      summary: Upload source files to a bot
+      description: |
+        Stores each file, extracts its text, splits the text into chunks of about 1200 characters, and saves
+        the chunks for retrieval. Files are processed in order. If one fails, processing stops and the
+        request returns `500`. Files already processed in that request are kept, and the failed file's
+        document is marked `FAILED`.
+
+        **Limits per bot:** 100 files and 100 MB in total. **Accepted types:** PDF, DOCX, TXT and MD,
+        checked by MIME type or file extension. On Vercel, each request must be under 4.5 MB, so the
+        web app uploads one file per request.
+      operationId: uploadDocuments
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [botId, files]
+              properties:
+                botId:
+                  type: string
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: Repeat the `files` field once for each file.
+            encoding:
+              files:
+                contentType: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, text/plain, text/markdown
+      responses:
+        "200":
+          description: All files processed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, uploaded, documents]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                  uploaded:
+                    type: integer
+                    description: Number of files processed.
+                  documents:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UploadedDocument"
+        "400":
+          description: No files or no `botId`, a limit exceeded, or an unsupported file type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noFiles:
+                  value: { error: "Select at least one file." }
+                tooMany:
+                  value: { error: "File limit exceeded." }
+                tooBig:
+                  value: { error: "Total upload limit is 100 MB." }
+                badType:
+                  value: { error: "Unsupported file type: slides.pptx" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Uploads are turned off (`UPLOADS_ENABLED=false`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Uploads are currently disabled." }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/BotSubmitted"
+        "500":
+          description: Storage is misconfigured, or a file could not be processed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                vercelLocal:
+                  value: { error: "Upload backend is misconfigured for Vercel. Set UPLOAD_BACKEND=vercel-blob and configure BLOB_READ_WRITE_TOKEN." }
+                noToken:
+                  value: { error: "Blob storage token is missing. Set BLOB_READ_WRITE_TOKEN in your deployment environment." }
+                processing:
+                  value: { error: "Could not process uploaded file." }
+
+  /api/documents/{documentId}:
+    parameters:
+      - name: documentId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [Documents]
+      summary: Delete a document
+      description: Deletes the document and its chunks, and tries to delete the stored file. If the stored file can't be deleted, the error is logged and the document is still removed.
+      operationId: deleteDocument
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, documentId]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                  documentId:
+                    type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/BotSubmitted"
+
+  /api/chat:
+    post:
+      tags: [Chat]
+      summary: Chat with my bot
+      description: |
+        Asks one of your own bots a question. Draft and submitted bots both work. Messages that share a
+        `sessionKey` share history, and the bot sees the last 8 messages. Each question is saved in the query log
+        with `actorRole: STUDENT`.
+      operationId: chat
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [botId, sessionKey, question]
+              properties:
+                botId:
+                  type: string
+                sessionKey:
+                  type: string
+                  minLength: 1
+                  description: Any string chosen by the client. Reuse it to continue a conversation.
+                question:
+                  $ref: "#/components/schemas/Question"
+      responses:
+        "200":
+          description: The bot's answer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [answer, retrievedChunks, trace]
+                properties:
+                  answer:
+                    type: string
+                  retrievedChunks:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RetrievedChunk"
+                  trace:
+                    $ref: "#/components/schemas/Trace"
+        "400":
+          description: Invalid body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Invalid chat request." }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/grader/query:
+    post:
+      tags: [Grader]
+      summary: Query a submitted bot
+      description: |
+        Asks a **submitted** bot a question. Each question is saved in the query log with `actorRole: GRADER`.
+
+        If the bot doesn't exist or hasn't been submitted, the server throws an error and returns `500`
+        with a body that is not JSON.
+      operationId: graderQuery
+      security:
+        - graderKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [studentId, question]
+              properties:
+                studentId:
+                  type: string
+                  description: The **bot ID** to query, despite the field name.
+                question:
+                  $ref: "#/components/schemas/Question"
+                sessionKey:
+                  type: string
+                  description: Questions that share a key share chat history. The default is `grader`, so all grader questions to a bot share one history unless you set this.
+                examId:
+                  type: string
+                  description: Accepted but ignored.
+            example:
+              studentId: cm5x8k2qv0001abcd1234efgh
+              question: Explain the role of RAG in enterprise QA.
+              sessionKey: grader-q1
+      responses:
+        "200":
+          description: The bot's answer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [studentId, botId, question, answer, trace, model, configVersion, submittedAt, timestamp]
+                properties:
+                  studentId:
+                    type: string
+                    description: The bot owner's **user ID**.
+                  botId:
+                    type: string
+                  question:
+                    type: string
+                  answer:
+                    type: string
+                  trace:
+                    $ref: "#/components/schemas/Trace"
+                  model:
+                    type: string
+                    description: Always the literal `gpt-5-nano`. For the model the API actually used, see `trace.llmModel`.
+                    example: gpt-5-nano
+                  configVersion:
+                    type: integer
+                  submittedAt:
+                    type: string
+                    format: date-time
+                  timestamp:
+                    type: string
+                    format: date-time
+        "400":
+          description: Invalid body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Invalid grader query." }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: The bot was not found or has not been submitted. The body is not JSON.
+
+  /api/admin/users:
+    get:
+      tags: [Admin (session)]
+      summary: List all users
+      operationId: listUsers
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: All users, oldest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [Admin (session)]
+      summary: Create a user
+      operationId: createUser
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  minLength: 1
+                  maxLength: 120
+                  description: Stored in lowercase and must not contain `@`.
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 128
+                role:
+                  $ref: "#/components/schemas/Role"
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user]
+                properties:
+                  user:
+                    $ref: "#/components/schemas/User"
+        "400":
+          description: Invalid username, password or role.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: A user with this username already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/admin/users/bulk:
+    post:
+      tags: [Admin (session)]
+      summary: Bulk-create students from CSV
+      description: |
+        Creates one `STUDENT` per data row of a CSV. The CSV must have a header row containing an
+        `Email ID` column (matched case-insensitively). Other columns are ignored.
+
+        For each row, the username is the part of the email before `@`, and the **starting password is the
+        same as the username**. Usernames that already exist are skipped. Blank rows are ignored.
+      operationId: bulkCreateUsers
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csv]
+              properties:
+                csv:
+                  type: string
+                  description: The full CSV text.
+            example:
+              csv: "Name,Email ID\nAsha Rao,asha.rao@example.edu\nBen Ito,ben.ito@example.edu\n"
+      responses:
+        "200":
+          description: Import results.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [created, skipped, invalid]
+                properties:
+                  created:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/User"
+                  skipped:
+                    type: array
+                    description: Usernames that already existed.
+                    items:
+                      type: string
+                  invalid:
+                    type: array
+                    description: Raw values from the `Email ID` column that didn't produce a valid username.
+                    items:
+                      type: string
+        "400":
+          description: '`csv` is missing, the CSV has no data rows, or there is no `Email ID` column.'
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "CSV must include an 'Email ID' column." }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/admin/users/{userId}:
+    parameters:
+      - name: userId
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      tags: [Admin (session)]
+      summary: Delete a user
+      description: Deletes the user along with their bots, documents, chats and query logs. Admins can't delete their own account or the built-in admin account.
+      operationId: deleteUser
+      security:
+        - sessionCookie: []
+      responses:
+        "200":
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Ok"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Tried to delete your own account or the built-in admin.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/admin/bots/inspect:
+    post:
+      tags: [Admin (session)]
+      summary: List a user's bots
+      description: The same as `POST /api/admin/key/user-bots`, but authenticated with an admin session instead of the API key.
+      operationId: adminInspectUserBots
+      security:
+        - sessionCookie: []
+      requestBody:
+        $ref: "#/components/requestBodies/UserLookup"
+      responses:
+        "200":
+          $ref: "#/components/responses/UserBots"
+        "400":
+          $ref: "#/components/responses/InvalidLookup"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/admin/bots/query:
+    post:
+      tags: [Admin (session)]
+      summary: Query any bot
+      description: |
+        The same as `POST /api/admin/key/query`, but authenticated with an admin session instead of the API key.
+        The default `sessionKey` is `admin-<adminUserId>`, so each admin gets a separate history.
+      operationId: adminSessionQuery
+      security:
+        - sessionCookie: []
+      requestBody:
+        $ref: "#/components/requestBodies/AdminQuery"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminQueryResult"
+        "400":
+          $ref: "#/components/responses/InvalidAdminQuery"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/admin/key/user-bots:
+    post:
+      tags: [Admin (API key)]
+      summary: List a user's bots
+      description: |
+        Returns a user and all their bots, with settings and document metadata. Use this to look up a
+        student's bot IDs before grading. Provide `userId` or `username`. If you provide both, `userId` is used.
+      operationId: apiKeyUserBots
+      security:
+        - adminKey: []
+      requestBody:
+        $ref: "#/components/requestBodies/UserLookup"
+      responses:
+        "200":
+          $ref: "#/components/responses/UserBots"
+        "400":
+          $ref: "#/components/responses/InvalidLookup"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/admin/key/query:
+    post:
+      tags: [Admin (API key)]
+      summary: Query any bot
+      description: |
+        Asks any bot a question, whether it is a draft or submitted. Each question is saved in the query log
+        with `actorRole: ADMIN`. The default `sessionKey` is `admin`.
+      operationId: apiKeyQuery
+      security:
+        - adminKey: []
+      requestBody:
+        $ref: "#/components/requestBodies/AdminQuery"
+      responses:
+        "200":
+          $ref: "#/components/responses/AdminQueryResult"
+        "400":
+          $ref: "#/components/responses/InvalidAdminQuery"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: midterm_session
+      description: Signed session token (HS256 JWT), set by `POST /api/auth/login`. Valid for 7 days.
+    graderKey:
+      type: apiKey
+      in: header
+      name: x-grader-key
+      description: Must equal the server's `GRADER_API_KEY`.
+    adminKey:
+      type: apiKey
+      in: header
+      name: x-admin-key
+      description: Must equal the server's `ADMIN_API_KEY`.
+
+  parameters:
+    BotId:
+      name: botId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  requestBodies:
+    UserLookup:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            description: Provide at least one of `userId` or `username`.
+            properties:
+              userId:
+                type: string
+              username:
+                type: string
+                description: Case-insensitive.
+            anyOf:
+              - required: [userId]
+              - required: [username]
+          example:
+            username: asha.rao
+    AdminQuery:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [botId, question]
+            properties:
+              botId:
+                type: string
+              question:
+                $ref: "#/components/schemas/Question"
+              sessionKey:
+                type: string
+                minLength: 1
+                description: Questions that share a key share chat history.
+
+  responses:
+    Unauthorized:
+      description: Not logged in, the session is invalid, or the API key is missing or wrong.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Unauthorized" }
+    InvalidCredentials:
+      description: Wrong username or password.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Invalid username or password." }
+    Forbidden:
+      description: Logged in, but not an admin.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Admin access required." }
+    NotFound:
+      description: The resource doesn't exist, or isn't owned by the logged-in user.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Bot not found." }
+    BotSubmitted:
+      description: The bot is submitted. Revert the submission before changing it.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Submitted bot cannot be edited until you revert the submission." }
+    InvalidLookup:
+      description: Neither `userId` nor `username` was provided.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Invalid request body." }
+    InvalidAdminQuery:
+      description: Invalid body.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example: { error: "Invalid admin query." }
+    UserBots:
+      description: The user and their bots.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [user, bots]
+            properties:
+              user:
+                type: object
+                required: [id, username, role, createdAt]
+                properties:
+                  id:
+                    type: string
+                  username:
+                    type: string
+                  role:
+                    $ref: "#/components/schemas/Role"
+                  createdAt:
+                    type: string
+                    format: date-time
+              bots:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AdminBotView"
+    AdminQueryResult:
+      description: The bot's answer.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [userId, username, botId, botStatus, question, answer, trace, retrievedChunks, configVersion, timestamp]
+            properties:
+              userId:
+                type: string
+                description: The bot owner's user ID.
+              username:
+                type: string
+                description: The bot owner's username.
+              botId:
+                type: string
+              botStatus:
+                $ref: "#/components/schemas/BotStatus"
+              question:
+                type: string
+              answer:
+                type: string
+              trace:
+                $ref: "#/components/schemas/Trace"
+              retrievedChunks:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RetrievedChunk"
+              configVersion:
+                type: integer
+              timestamp:
+                type: string
+                format: date-time
+
+  schemas:
+    Ok:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          const: true
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A message suitable for showing to the user.
+
+    Role:
+      type: string
+      enum: [STUDENT, GRADER, ADMIN]
+      default: STUDENT
+
+    BotStatus:
+      type: string
+      enum: [DRAFT, SUBMITTED]
+
+    DocumentStatus:
+      type: string
+      enum: [UPLOADED, PROCESSING, READY, FAILED]
+
+    Question:
+      type: string
+      minLength: 1
+      maxLength: 4000
+
+    User:
+      type: object
+      required: [id, email, role, createdAt]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          description: The username. The field name is historical.
+          example: asha.rao
+        role:
+          $ref: "#/components/schemas/Role"
+        createdAt:
+          type: string
+          format: date-time
+
+    BotSettings:
+      type: object
+      required: [name, systemPrompt, temperature, topP, topK, maxOutputTokens]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        systemPrompt:
+          type: string
+          maxLength: 12000
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          description: Stored, but not currently sent to the model.
+        topP:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Stored, but not currently sent to the model.
+        topK:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Stored, but not currently sent to the model.
+        maxOutputTokens:
+          type: integer
+          minimum: 32
+          maximum: 4096
+          description: The output token budget for each answer.
+
+    Bot:
+      type: object
+      required: [id, userId, examId, name, isDemo, status, systemPrompt, temperature, topP, topK, maxOutputTokens, configVersion, submittedAt, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+        examId:
+          type: string
+          example: midterm_t4_2026
+        name:
+          type: string
+        isDemo:
+          type: boolean
+        status:
+          $ref: "#/components/schemas/BotStatus"
+        systemPrompt:
+          type: string
+        temperature:
+          type: number
+          default: 0.2
+        topP:
+          type: number
+          default: 1.0
+        topK:
+          type: integer
+          default: 20
+        maxOutputTokens:
+          type: integer
+          default: 512
+        configVersion:
+          type: integer
+          description: Increments on every settings update, submit and revert.
+        submittedAt:
+          type: [string, "null"]
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    BotWithDocuments:
+      allOf:
+        - $ref: "#/components/schemas/Bot"
+        - type: object
+          required: [documents]
+          properties:
+            documents:
+              type: array
+              items:
+                $ref: "#/components/schemas/Document"
+
+    Document:
+      type: object
+      required: [id, botId, filename, storagePath, mimeType, sizeBytes, chunkCount, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+        botId:
+          type: string
+        filename:
+          type: string
+        storagePath:
+          type: string
+          description: A local file path or a Vercel Blob URL, depending on `UPLOAD_BACKEND`.
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+        chunkCount:
+          type: integer
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    UploadedDocument:
+      type: object
+      required: [id, filename, mimeType, sizeBytes, status, chunkCount]
+      properties:
+        id:
+          type: string
+        filename:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        chunkCount:
+          type: integer
+
+    AdminBotView:
+      type: object
+      description: A bot as returned to admins. It omits `userId`, `examId` and `isDemo`, and lists documents without `storagePath`.
+      required: [id, name, status, systemPrompt, temperature, topP, topK, maxOutputTokens, configVersion, submittedAt, createdAt, updatedAt, documents]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          $ref: "#/components/schemas/BotStatus"
+        systemPrompt:
+          type: string
+        temperature:
+          type: number
+        topP:
+          type: number
+        topK:
+          type: integer
+        maxOutputTokens:
+          type: integer
+        configVersion:
+          type: integer
+        submittedAt:
+          type: [string, "null"]
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        documents:
+          type: array
+          description: Newest first.
+          items:
+            type: object
+            required: [id, filename, mimeType, sizeBytes, chunkCount, status, createdAt, updatedAt]
+            properties:
+              id:
+                type: string
+              filename:
+                type: string
+              mimeType:
+                type: string
+              sizeBytes:
+                type: integer
+              chunkCount:
+                type: integer
+              status:
+                $ref: "#/components/schemas/DocumentStatus"
+              createdAt:
+                type: string
+                format: date-time
+              updatedAt:
+                type: string
+                format: date-time
+
+    RetrievedChunk:
+      type: object
+      description: A source chunk that was added to the prompt for this answer.
+      required: [filename, chunkIndex]
+      properties:
+        filename:
+          type: string
+        chunkIndex:
+          type: integer
+
+    Trace:
+      type: object
+      description: Diagnostics showing how the answer was produced.
+      required: [llmAttempted, llmUsed, fallbackUsed, attempts]
+      properties:
+        llmAttempted:
+          type: boolean
+          description: Whether a model call was made. This is false when `OPENAI_API_KEY` is not set.
+        llmUsed:
+          type: boolean
+          description: Whether the answer came from the model.
+        fallbackUsed:
+          type: boolean
+          description: True when the model was unavailable or returned nothing, so the answer was assembled from the retrieved text instead.
+        attempts:
+          type: integer
+          description: Number of model calls. A second call, with less context, is made if the first one ran out of tokens.
+        llmModel:
+          type: string
+          description: The model name reported by the OpenAI API.
+        finishReason:
+          type: [string, "null"]
+          example: stop
+        error:
+          type: string
+          description: The model error message, if a call failed.
